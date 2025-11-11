@@ -1,98 +1,55 @@
-# Verwende spezifische Version für Reproduzierbarkeit
-FROM node:22.11-slim AS base
+# Base will install runtime dependencies and configure generics
+FROM node:16-slim as base
 
-LABEL maintainer="Marko Kajzer <markokajzer91@gmail.com>"
-LABEL org.opencontainers.image.source="https://github.com/markokajzer/discord-soundbot"
-LABEL org.opencontainers.image.description="Discord Soundbot with Node.js 22"
+LABEL maintainer="Marko Kajzer <markokajzer91@gmail.com>, Nico Stapelbroek <discord-soundbot@nstapelbroek.com>"
 
 RUN mkdir /app && chown -R node:node /app
 WORKDIR /app
 
-# Installiere tini in einem Layer
-RUN apt-get -qq update && \
-    apt-get -qq -y install --no-install-recommends \
-    wget \
-    ca-certificates && \
-    wget -qO /tini https://github.com/krallin/tini/releases/download/v0.19.0/tini-$(dpkg --print-architecture) && \
-    chmod +x /tini && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+# Add `tiny` init for signal forwarding
+RUN apt-get -qq update > /dev/null && \
+    apt-get -qq -y install wget > /dev/null && \
+    rm -rf /var/lib/apt/lists
+RUN wget -qO /tini https://github.com/krallin/tini/releases/download/v0.18.0/tini-$(dpkg --print-architecture) && \
+    chmod +x /tini
 
 ####################################################################################################
 
-FROM base AS builder
+# Builder will install system dependencies
+FROM base as builder
 
-# Installiere nur notwendige Build-Dependencies
-RUN apt-get -qq update && \
-    apt-get -qq -y install --no-install-recommends \
-    git \
-    g++ \
-    make \
-    python3 \
-    tar \
-    xz-utils && \
-    rm -rf /var/lib/apt/lists/*
-
-# FFmpeg statisch installieren
+# Install ffmpeg and other deps
+RUN apt-get -qq update > /dev/null && \
+    apt-get -qq -y install git g++ make python3.11 tar xz-utils > /dev/null && \
+    rm -rf /var/lib/apt/lists
 RUN wget -qO /tmp/ffmpeg.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-$(dpkg --print-architecture)-static.tar.xz && \
-    mkdir -p /tmp/ffmpeg && \
-    tar xf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg --strip-components=1 && \
-    cp /tmp/ffmpeg/ffmpeg /tmp/ffmpeg/ffprobe /usr/local/bin/ && \
-    chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe && \
-    rm -rf /tmp/ffmpeg*
+    tar -x -C /usr/local/bin --strip-components 1 -f /tmp/ffmpeg.tar.xz --wildcards '*/ffmpeg' && \
+    rm /tmp/ffmpeg.tar.xz
 
-USER node
+####################################################################################################
 
-# Kopiere nur package files für besseres Caching
-COPY --chown=node:node package*.json ./
+# Build will compile ts to js
+FROM builder AS build
 
-# Installiere ALLE Dependencies inkl. devDependencies (TypeScript!)
-# Wichtig: NODE_ENV darf NICHT production sein hier
-RUN npm ci && \
+# Copy files
+COPY --chown=node:node . /app
+
+# Install compile dependencies
+RUN npm install && \
     npm cache clean --force
 
-# Kopiere Quellcode (inkl. tsconfig.json und src/)
-COPY --chown=node:node . .
-
-# TypeScript Build ausführen
+# Build project
 RUN npm run build
 
-# Jetzt Production-Dependencies neu installieren (ohne devDependencies)
-# Dies entfernt TypeScript etc. für kleineres finales Image
-RUN npm ci --only=production && \
-    npm cache clean --force
-
 ####################################################################################################
 
-FROM base AS production
+# release has the bare minimum to run the application
+FROM base as release
 
-# Setze NODE_ENV erst hier, damit es den Build nicht beeinflusst
-ENV NODE_ENV=production \
-    NPM_CONFIG_LOGLEVEL=warn
-
-# Nur Runtime-Dependencies
-RUN apt-get -qq update && \
-    apt-get -qq -y install --no-install-recommends ca-certificates && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
-
-# FFmpeg von builder
-COPY --from=builder /usr/local/bin/ffmpeg /usr/local/bin/ffmpeg
-COPY --from=builder /usr/local/bin/ffprobe /usr/local/bin/ffprobe
+COPY --from=build --chown=node:node /usr/local/bin/ffmpeg /usr/local/bin/ffmpeg
+COPY --from=build --chown=node:node /app .
 
 USER node
-
-# Kopiere nur die gebauten Dateien und Production-Dependencies
-COPY --from=builder --chown=node:node /app/dist /app/dist
-COPY --from=builder --chown=node:node /app/node_modules /app/node_modules
-COPY --from=builder --chown=node:node /app/package*.json /app/
-
-# Kopiere auch config files falls vorhanden
-COPY --from=builder --chown=node:node /app/config /app/config
-
-VOLUME ["/app/sounds", "/app/config"]
-
+ENV NODE_ENV=production
 ENTRYPOINT ["/tini", "--"]
-
-# Korrekter Einstiegspunkt für TypeScript-Build
-CMD ["node", "-r", "module-alias/register", "dist/bin/soundbot.js"]
+CMD ["npm", "run", "serve"]
